@@ -1,0 +1,40 @@
+[project]
+name = "quantizedgemm"
+version = "0.1.0"
+description = "W8A8 quantized GEMM kernel development pipeline"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy",
+    "torch>=2.4.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "triton>=3.0.0",
+]
+analysis = [
+    "matplotlib",
+    "pandas",
+    "tabulate",
+]
+integration = [
+    "datasets",
+    "lm-eval",
+    "transformers",
+]
+runpod = [
+    "datasets",
+    "lm-eval",
+    "matplotlib",
+    "pandas",
+    "tabulate",
+    "transformers",
+    "triton>=3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-benchmark",
+]
