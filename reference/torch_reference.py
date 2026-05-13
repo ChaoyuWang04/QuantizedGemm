@@ -122,15 +122,27 @@ def w8a8_scaled_mm_reference(
     assert scale_a.shape == (M, 1), f"scale_a expected [{M}, 1], got {scale_a.shape}"
     assert scale_b.shape == (1, N), f"scale_b expected [1, {N}], got {scale_b.shape}"
 
-    # int8 乘法累加必须放到 int32 域,否则 K 较大时会溢出。
-    a_i32 = a.to(torch.int32)
-    b_i32 = b.to(torch.int32)
-    acc = torch.matmul(a_i32, b_i32)  # [M, N] int32
+    # int8 乘法累加必须放到 int32 域, 否则 K 较大时溢出。这个版本是金标准,
+    # 严格对齐硬件 Tensor Core mma.s8.s8.s32 指令的语义: 用整数精确加法。
+    #
+    # PyTorch 后端限制: torch.matmul 在 CUDA 上不支持 int32
+    # ("addmm_cuda" not implemented for 'Int"). 解决办法是搬到 CPU 算 int32
+    # matmul (CPU 后端支持). 是的, 这会有一次 GPU<->CPU 传输, 但 reference
+    # 本来就是"慢但严格正确"的, 后面的 Triton/CUTLASS 才是高速路径。
+    #
+    # 为什么不用 fp32 累加:
+    #   fp32 ULP 在 K=4096 极端输入下可能丢 1-2 单位精度, 不严格匹配硬件 mma.
+    #   要做"几乎严格"的对比, 用 w8a8_scaled_mm_reference_fp64 (fp64 累加).
+    a_i32_cpu = a.to(torch.int32).cpu()
+    b_i32_cpu = b.to(torch.int32).cpu()
+    acc_cpu = torch.matmul(a_i32_cpu, b_i32_cpu)  # [M, N] int32, on CPU
+    # 算完搬回原设备做后续 dequant. dequant 是 fp32 路径, GPU 支持良好。
+    acc = acc_cpu.to(a.device).to(torch.float32)
 
-    # int32 累加结果转 fp32 后乘两个 scale,PyTorch 会自动广播 [M,1] 和 [1,N]。
-    out_fp32 = acc.to(torch.float32) * scale_a * scale_b
+    # 累加结果乘两个 scale, PyTorch 会自动广播 [M,1] 和 [1,N]。
+    out_fp32 = acc * scale_a * scale_b
 
-    # bias 在 fp32 中相加,最后统一转成用户要求的输出 dtype。
+    # bias 在 fp32 中相加, 最后统一转成用户要求的输出 dtype。
     if bias is not None:
         out_fp32 = out_fp32 + bias.to(torch.float32)
 
@@ -146,24 +158,22 @@ def w8a8_scaled_mm_reference_fp64(
     out_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """
-    Ultra-reference: 全程用 fp64 累加,不走 int32 路径。
+    Ultra-reference: 全程用 fp64 累加, 作为独立路径交叉验证主 reference。
 
-    这个版本存在的唯一目的: 验证 w8a8_scaled_mm_reference 在极端
-    形状 (例如 K=16384 或 input 全 127) 下没有 int32 溢出。
+    主 reference 路径:
+        - GPU 输入: 数据搬到 CPU 算 int32 matmul, 然后搬回 (慢但严格)
+        - CPU 输入: 直接 int32 matmul
+    本 fp64 reference 路径:
+        - 任何设备: 直接 fp64 matmul, PyTorch 原生支持
 
-    int8 累加的理论安全边界:
-        max |x_q * w_q| = 128 * 128 = 16384
-        K 个累加: 16384 * K
-        int32 上限: 2^31 - 1 ≈ 2.15e9
-        => K 安全上限 ≈ 2.15e9 / 16384 ≈ 131072
+    两个独立路径走得通同样的形状测试, 才能证明 reference 实现没 bug.
+    这是 test_cross_int32_vs_fp64_random 的设计依据。
 
-    所以 K < 131072 时 int32 版本一定不溢出, 但还是用 fp64 版本兜底,
-    免得后面 batch matmul 或者 split-K 优化时算错边界。
-
-    用法: 在 test_correctness.py 里加一个测试,
-        out_int32 = w8a8_scaled_mm_reference(...)
-        out_fp64  = w8a8_scaled_mm_reference_fp64(...)
-        assert torch.allclose(out_int32, out_fp64, atol=1e-4)
+    精度上界对比 (累加结果可表示的最大整数):
+        int32: ±2.15e9, 极端形状 K=131072 仍精确
+        fp64:  ±2^53 ≈ ±9e15, 任何实际形状都远没到上界
+        fp32:  ±1.67e7, K=4096 全极值情况下会有 1-2 ULP 误差
+               -> 这就是为什么主 reference 不用 fp32 累加
 
     参数和返回: 同 w8a8_scaled_mm_reference。
     """
