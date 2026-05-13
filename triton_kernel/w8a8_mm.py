@@ -1,17 +1,18 @@
 """
-Triton kernel for W8A8 scaled matmul.
+W8A8 scaled matmul 的 Triton kernel 入口占位文件。
 
-To be implemented in P2 (Day 3-5).
+当前项目还处在 P1/P2 交界,这里先记录 Triton 实现计划,并显式抛出
+NotImplementedError,避免调用方误以为 kernel 已可用。
 
-Plan:
-    v1: naive triton matmul with manual int32 accumulation + scale apply
-    v2: add @triton.autotune over (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)
-    v3: Nsight-guided optimizations (vectorization, swizzling, split-K if beneficial)
+计划:
+    v1: 朴素 Triton matmul,手动 int32 累加并应用 scale。
+    v2: 加 @triton.autotune 搜索 BLOCK_M/BLOCK_N/BLOCK_K 等参数。
+    v3: 根据 Nsight 结果优化访存、swizzle 和可能的 split-K。
 
-Reference:
+参考:
     https://huggingface.co/kernels-community/triton-scaled-mm
     https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/w8a8_utils.py
 """
 
-# Placeholder — implement in P2
+# 当前文件只是 P2 的实现占位;导入时直接失败可以暴露误用。
 raise NotImplementedError("Triton kernel implementation pending (Stage P2)")
