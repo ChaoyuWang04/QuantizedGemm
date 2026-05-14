@@ -1,43 +1,65 @@
 """
-W8A8 GEMM 单算子 benchmark 入口。
+Performance benchmark - W8A8 Triton kernel vs cuBLAS fp16 baseline.
 
-这个脚本负责构造固定 shape 的 int8 输入,选择 reference/Triton/CUTLASS kernel,
-用 CUDA Event 统计延迟,并计算 TFLOPS、带宽利用率和算力利用率。
+设计原则 (四个新手坑的修正):
+    1. Warmup: 跑 10 次丢弃, 排除 JIT 编译 + cache 加载时间
+    2. Sync:   用 torch.cuda.Event 严格测 kernel 时间
+    3. Repeat: 跑 100 次取中位数 (不是平均, 排除 outlier)
+    4. Baseline: 对比 cuBLAS fp16 + Roofline 上限, 给出"快/慢"的绝对判断
 
-用法:
-    python benchmarks/bench_kernel.py --kernel reference --shape 1,4096,4096
-    python benchmarks/bench_kernel.py --kernel triton --all-shapes
+输出三个核心指标:
+    - latency: 单次 kernel 时间 (微秒)
+    - TFLOPS:  实际算力利用 (compute intensity)
+    - 加速比:   vs cuBLAS fp16
 
-输出:
-    - 终端表格:latency、TFLOPS、带宽和算力利用率。
-    - 可选 JSON:benchmarks/results/{kernel}_{shape}_{timestamp}.json。
+执行:
+    python benchmarks/bench_kernel.py                  # 所有形状
+    python benchmarks/bench_kernel.py --shape S2       # 只跑 S2
+    python benchmarks/bench_kernel.py --reference      # 也测 reference (极慢)
+    python benchmarks/bench_kernel.py --detail         # 打印详细 metrics
 """
 
 import argparse
-import json
+import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import torch
 
-import sys
-
-# 允许从仓库根目录导入 reference 模块,方便直接运行本脚本。
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from reference.torch_reference import (
     w8a8_scaled_mm_reference,
+    cublas_fp16_baseline,
     quantize_per_token,
     quantize_per_channel,
 )
+from triton_kernel.w8a8_mm import w8a8_scaled_mm_triton
 
 
-# RTX 4090 硬件常数,用于把实测速度换算成利用率。
-RTX4090_INT8_TOPS_DENSE = 330e12    # 330 TOPS dense
-RTX4090_HBM_BANDWIDTH = 1008e9      # 1008 GB/s
+# ============================================================
+# 硬件常数 (需要根据实际 GPU 调整)
+# ============================================================
+
+HARDWARE_SPECS = {
+    "NVIDIA GeForce RTX 4090": {
+        "int8_tops_dense": 330e12,
+        "fp16_tflops": 165e12,
+        "hbm_bandwidth": 1008e9,
+    },
+    "NVIDIA GeForce RTX 5090": {
+        # Triton 当前把 SM12x 当 SM80 用, 实际可达算力打折
+        "int8_tops_dense": 838e12,
+        "fp16_tflops": 419e12,
+        "hbm_bandwidth": 1792e9,
+    },
+}
+
+DEFAULT_SPEC = HARDWARE_SPECS["NVIDIA GeForce RTX 4090"]
 
 
-# LLaMA-7B 常见投影层 shape,覆盖 decode 和 prefill 场景。
+# ============================================================
+# LLaMA-7B 测试形状
+# ============================================================
 SHAPES = {
     "S1": (1, 4096, 4096),
     "S2": (16, 4096, 4096),
@@ -46,162 +68,249 @@ SHAPES = {
 }
 
 
-def make_inputs(M, N, K, device="cuda", seed=42):
+# ============================================================
+# 核心计时函数
+# ============================================================
+
+def benchmark_fn(fn, warmup: int = 10, repeat: int = 100) -> dict:
     """
-    生成可复现的随机 int8 输入和 fp32 scale。
-
-    返回:
-        a/b 是 int8 矩阵,sa/sb 分别是 per-token 和 per-channel scale。
+    严格的 CUDA kernel 计时.
     """
-    torch.manual_seed(seed)
-    # 激活和权重直接采样 int8,模拟已经量化后的输入。
-    a = torch.randint(-128, 128, (M, K), dtype=torch.int8, device=device)
-    b = torch.randint(-128, 128, (K, N), dtype=torch.int8, device=device)
-    # scale 范围参考需求文档中的真实分布假设。
-    sa = torch.rand(M, 1, dtype=torch.float32, device=device) * 0.1
-    sb = torch.rand(1, N, dtype=torch.float32, device=device) * 0.01
-    return a, b, sa, sb
-
-
-def benchmark_kernel(kernel_fn, a, b, sa, sb, warmup=20, repeat=100):
-    """
-    用 CUDA Event 对单个 kernel 做标准 benchmark。
-
-    warmup 用于排除首次运行开销,repeat 用于平均多次运行的延迟。
-
-    返回:
-        包含 latency_us、tflops、bandwidth_gbps、bandwidth_util、compute_util 的字典。
-    """
-    M, K = a.shape
-    _, N = b.shape
-
-    # 预热 kernel,让 CUDA context、缓存和 JIT 等开销不进入计时。
     for _ in range(warmup):
-        _ = kernel_fn(a, b, sa, sb)
+        fn()
     torch.cuda.synchronize()
 
-    # 使用 CUDA Event 在 GPU 时间线上计时,比 CPU time 更准确。
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    times = []
     for _ in range(repeat):
-        _ = kernel_fn(a, b, sa, sb)
-    end.record()
-    torch.cuda.synchronize()
-    
-    latency_ms = start.elapsed_time(end) / repeat
-    latency_us = latency_ms * 1000
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
 
-    # 理论计算量:矩阵乘是 2*M*N*K ops。
-    flops = 2 * M * N * K
-    # 粗略访存量:int8 A + int8 B + fp16 output,忽略 scale 和缓存复用。
-    bytes_moved = M * K + K * N + M * N * 2
+    times.sort()
+    median_ms = times[len(times) // 2]
+    min_ms = times[0]
+    p95_ms = times[int(len(times) * 0.95)]
 
-    # 将平均延迟换算为吞吐、带宽和相对 4090 峰值的利用率。
-    tflops = flops / (latency_ms * 1e-3) / 1e12
-    bandwidth_gbps = bytes_moved / (latency_ms * 1e-3) / 1e9
-    bandwidth_util = bandwidth_gbps / (RTX4090_HBM_BANDWIDTH / 1e9)
-    compute_util = (tflops * 1e12) / RTX4090_INT8_TOPS_DENSE
-    
     return {
-        "latency_us": round(latency_us, 2),
-        "tflops": round(tflops, 3),
-        "bandwidth_gbps": round(bandwidth_gbps, 1),
-        "bandwidth_util": round(bandwidth_util, 3),
-        "compute_util": round(compute_util, 3),
-        "shape": [M, N, K],
-        "flops": flops,
-        "bytes_moved": bytes_moved,
+        "latency_us": median_ms * 1000,
+        "latency_us_min": min_ms * 1000,
+        "latency_us_p95": p95_ms * 1000,
     }
 
 
-def get_kernel(name: str):
-    """
-    根据命令行传入的名字选择 kernel 函数。
+def compute_metrics(latency_us: float, M: int, N: int, K: int,
+                    spec: dict) -> dict:
+    """根据延迟和形状, 算 TFLOPS, 带宽利用, Roofline 位置."""
+    latency_s = latency_us * 1e-6
 
-    Triton 和 CUTLASS 还未实现时显式报错,避免 benchmark 跑到空实现。
-    """
-    if name == "reference":
-        return w8a8_scaled_mm_reference
-    elif name == "triton":
-        # from triton_kernel.w8a8_mm import w8a8_scaled_mm_triton
-        # return w8a8_scaled_mm_triton
-        raise NotImplementedError("Triton kernel not yet implemented (P2)")
-    elif name == "cutlass":
-        raise NotImplementedError("CUTLASS kernel not yet implemented (P3)")
+    flops = 2 * M * N * K
+    tflops = flops / latency_s / 1e12
+
+    bytes_moved = M * K + K * N + M * N * 2
+    bandwidth_gbps = bytes_moved / latency_s / 1e9
+
+    ai = flops / bytes_moved
+    ai_crossover = spec["int8_tops_dense"] / spec["hbm_bandwidth"]
+    if ai < ai_crossover:
+        roof_tflops = (spec["hbm_bandwidth"] * ai) / 1e12
+        bound = "memory"
     else:
-        raise ValueError(f"Unknown kernel: {name}")
+        roof_tflops = spec["int8_tops_dense"] / 1e12
+        bound = "compute"
+
+    bandwidth_util = bandwidth_gbps / (spec["hbm_bandwidth"] / 1e9)
+    compute_util = (tflops * 1e12) / spec["int8_tops_dense"]
+    roof_util = tflops / roof_tflops if roof_tflops > 0 else 0
+
+    return {
+        "tflops": tflops,
+        "bandwidth_gbps": bandwidth_gbps,
+        "bandwidth_util": bandwidth_util,
+        "compute_util": compute_util,
+        "ai": ai,
+        "bound": bound,
+        "roof_tflops": roof_tflops,
+        "roof_util": roof_util,
+    }
 
 
-def save_result(result: dict, kernel: str, shape_id: str):
-    """
-    将 benchmark 结果保存成 JSON,用于后续性能回归和画图。
+# ============================================================
+# 单形状测试
+# ============================================================
 
-    文件名包含 kernel、shape 和时间戳,避免覆盖历史结果。
-    """
-    out_dir = Path(__file__).parent / "results"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = out_dir / f"{kernel}_{shape_id}_{ts}.json"
-    with open(filename, "w") as f:
-        # 写入硬件名、shape、吞吐等完整上下文,方便离线分析。
-        json.dump({
-            "kernel": kernel,
-            "shape_id": shape_id,
-            "timestamp": ts,
-            "gpu": torch.cuda.get_device_name(0),
-            **result,
-        }, f, indent=2)
-    return filename
+def run_shape(shape_id: str, M: int, N: int, K: int, spec: dict,
+              test_reference: bool = False) -> dict:
+    torch.manual_seed(42)
 
+    x_fp16 = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    w_fp16 = torch.randn(K, N, device="cuda", dtype=torch.float16) * 0.1
+    x_q, sa = quantize_per_token(x_fp16)
+    w_q, sb = quantize_per_channel(w_fp16)
+
+    result = {"shape_id": shape_id, "M": M, "N": N, "K": K}
+
+    # 1. Triton W8A8
+    bench = benchmark_fn(lambda: w8a8_scaled_mm_triton(x_q, w_q, sa, sb))
+    metrics = compute_metrics(bench["latency_us"], M, N, K, spec)
+    result["triton"] = {**bench, **metrics}
+
+    # 2. cuBLAS fp16 baseline
+    bench = benchmark_fn(lambda: cublas_fp16_baseline(x_fp16, w_fp16))
+    metrics = compute_metrics(bench["latency_us"], M, N, K, spec)
+    result["cublas"] = {**bench, **metrics}
+
+    # 3. Reference (可选, 极慢)
+    if test_reference and M * N * K < 1e9:
+        bench = benchmark_fn(
+            lambda: w8a8_scaled_mm_reference(x_q, w_q, sa, sb),
+            warmup=2, repeat=5,
+        )
+        result["reference"] = bench
+
+    # 4. Speedup
+    triton_us = result["triton"]["latency_us"]
+    cublas_us = result["cublas"]["latency_us"]
+    result["speedup_vs_cublas"] = cublas_us / triton_us
+    if "reference" in result:
+        result["speedup_vs_reference"] = result["reference"]["latency_us"] / triton_us
+
+    return result
+
+
+# ============================================================
+# 打印结果
+# ============================================================
+
+def print_results(results: list, spec: dict):
+    print()
+    print("=" * 120)
+    print("Performance Benchmark Results")
+    print("=" * 120)
+    print()
+
+    print(f"{'Shape':<6} {'(M,N,K)':<22} "
+          f"{'Triton (us)':<13} {'cuBLAS (us)':<13} "
+          f"{'Speedup':<10} {'TFLOPS':<10} "
+          f"{'Roof%':<8} {'Bound':<10}")
+    print("-" * 120)
+
+    for r in results:
+        shape_str = f"({r['M']:>4}, {r['N']:>4}, {r['K']:>4})"
+        triton_us = r["triton"]["latency_us"]
+        cublas_us = r["cublas"]["latency_us"]
+        speedup = r["speedup_vs_cublas"]
+        tflops = r["triton"]["tflops"]
+        roof = r["triton"]["roof_util"]
+        bound = r["triton"]["bound"]
+
+        speedup_str = f"{speedup:.2f}x"
+
+        print(f"{r['shape_id']:<6} {shape_str:<22} "
+              f"{triton_us:<13.2f} {cublas_us:<13.2f} "
+              f"{speedup_str:<10} "
+              f"{tflops:<10.2f} "
+              f"{roof*100:<7.1f}% "
+              f"{bound:<10}")
+
+    print()
+    print("=" * 120)
+    print("解读")
+    print("=" * 120)
+    print()
+    print("Speedup vs cuBLAS:")
+    print("  > 1.0x: Triton W8A8 比 cuBLAS fp16 快 (W8A8 路线在该形状上有价值)")
+    print("  ~ 1.0x: 持平 (memory-bound 形状常见, dequant 开销吃掉收益)")
+    print("  < 1.0x: 比 cuBLAS 慢 (W8A8 在该形状上没意义, 不如直接用 fp16)")
+    print()
+    print("Roof%: 距 Roofline 上限多远")
+    print("  > 70%: 接近物理极限, 优化空间已小")
+    print("  30-70%: 健康")
+    print("  < 30%: 严重未达上限, 还有大量优化空间 (典型 v1 表现)")
+    print()
+    print("Bound:")
+    print("  memory:  形状受显存带宽限制, 优化方向 = 减少读写")
+    print("  compute: 形状受算力限制, 优化方向 = 提高 Tensor Core 占用率")
+
+
+def print_per_shape_detail(results: list):
+    print()
+    print("=" * 120)
+    print("Per-shape detail")
+    print("=" * 120)
+
+    for r in results:
+        print()
+        print(f"--- {r['shape_id']} (M={r['M']}, N={r['N']}, K={r['K']}) ---")
+        print(f"  AI (ops/byte):       {r['triton']['ai']:.2f}")
+        print(f"  Bound type:          {r['triton']['bound']}")
+        print(f"  Roof TFLOPS:         {r['triton']['roof_tflops']:.2f}")
+        print()
+        print(f"  Triton W8A8:")
+        print(f"    latency (us):      {r['triton']['latency_us']:.2f} "
+              f"(min={r['triton']['latency_us_min']:.2f}, "
+              f"p95={r['triton']['latency_us_p95']:.2f})")
+        print(f"    TFLOPS:            {r['triton']['tflops']:.2f}")
+        print(f"    bandwidth (GB/s):  {r['triton']['bandwidth_gbps']:.1f}")
+        print(f"    bandwidth util:    {r['triton']['bandwidth_util']*100:.1f}%")
+        print(f"    compute util:      {r['triton']['compute_util']*100:.1f}%")
+        print(f"    roof util:         {r['triton']['roof_util']*100:.1f}%")
+        print()
+        print(f"  cuBLAS fp16:")
+        print(f"    latency (us):      {r['cublas']['latency_us']:.2f}")
+        print(f"    TFLOPS:            {r['cublas']['tflops']:.2f}")
+        print(f"    bandwidth (GB/s):  {r['cublas']['bandwidth_gbps']:.1f}")
+        print()
+        print(f"  Speedup vs cuBLAS:   {r['speedup_vs_cublas']:.2f}x")
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    """解析命令行参数,选择 shape/kernel,执行 benchmark 并打印表格。"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kernel", choices=["reference", "triton", "cutlass"], 
-                        default="reference")
-    parser.add_argument("--shape", type=str, help="M,N,K e.g. 1,4096,4096")
-    parser.add_argument("--all-shapes", action="store_true", 
-                        help="Run all LLaMA-7B shapes")
-    parser.add_argument("--save", action="store_true", help="Save results to JSON")
+    parser.add_argument("--shape", choices=list(SHAPES.keys()) + ["all"],
+                        default="all")
+    parser.add_argument("--detail", action="store_true")
+    parser.add_argument("--reference", action="store_true")
     args = parser.parse_args()
 
-    # 当前 benchmark 依赖 CUDA Event,没有 GPU 时直接退出。
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available")
-        return
+        sys.exit(1)
 
-    kernel_fn = get_kernel(args.kernel)
+    gpu_name = torch.cuda.get_device_name(0)
+    spec = HARDWARE_SPECS.get(gpu_name, DEFAULT_SPEC)
+    print(f"GPU:                 {gpu_name}")
+    print(f"INT8 TOPS (dense):   {spec['int8_tops_dense']/1e12:.0f}")
+    print(f"FP16 TFLOPS:         {spec['fp16_tflops']/1e12:.0f}")
+    print(f"HBM Bandwidth:       {spec['hbm_bandwidth']/1e9:.0f} GB/s")
+    print(f"AI Crossover:        {spec['int8_tops_dense']/spec['hbm_bandwidth']:.1f} ops/byte")
+    if gpu_name not in HARDWARE_SPECS:
+        print(f"WARN: GPU not in spec table, using 4090 numbers as fallback")
 
-    # 命令行可以指定所有标准 shape、单个自定义 shape,或使用默认 S2。
-    if args.all_shapes:
+    if args.shape == "all":
         shapes_to_run = list(SHAPES.items())
-    elif args.shape:
-        M, N, K = map(int, args.shape.split(","))
-        shapes_to_run = [("custom", (M, N, K))]
     else:
-        shapes_to_run = [("S2", SHAPES["S2"])]  # default
+        shapes_to_run = [(args.shape, SHAPES[args.shape])]
 
-    # 打印固定宽度表头,方便对比不同 shape 的性能。
-    print(f"=== Benchmarking {args.kernel} on {torch.cuda.get_device_name(0)} ===")
-    print(f"{'Shape':<8} {'(M,N,K)':<20} {'Latency(us)':<12} "
-          f"{'TFLOPS':<10} {'BW(GB/s)':<10} {'BW%':<8} {'Comp%':<8}")
-    print("-" * 80)
-
+    print()
+    results = []
     for shape_id, (M, N, K) in shapes_to_run:
-        # 每个 shape 独立生成输入,保证结果可复现。
-        a, b, sa, sb = make_inputs(M, N, K)
-        result = benchmark_kernel(kernel_fn, a, b, sa, sb)
-        # 控制台输出只保留关键性能指标,详细上下文可选写 JSON。
-        print(f"{shape_id:<8} {str((M,N,K)):<20} "
-              f"{result['latency_us']:<12} "
-              f"{result['tflops']:<10} "
-              f"{result['bandwidth_gbps']:<10} "
-              f"{result['bandwidth_util']*100:<7.1f}% "
-              f"{result['compute_util']*100:<7.1f}%")
-        if args.save:
-            path = save_result(result, args.kernel, shape_id)
-            print(f"  -> saved to {path}")
+        print(f"Running {shape_id} (M={M}, N={N}, K={K}) ...", end=" ", flush=True)
+        t0 = time.time()
+        r = run_shape(shape_id, M, N, K, spec, test_reference=args.reference)
+        t1 = time.time()
+        print(f"done ({t1-t0:.1f}s)")
+        results.append(r)
+
+    print_results(results, spec)
+    if args.detail:
+        print_per_shape_detail(results)
 
 
 if __name__ == "__main__":
