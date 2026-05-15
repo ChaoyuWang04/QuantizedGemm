@@ -1,22 +1,17 @@
 """
-Performance benchmark - W8A8 Triton kernel vs cuBLAS fp16 baseline.
+Performance benchmark - W8A8 Triton kernel 多版本对比.
 
-设计原则 (四个新手坑的修正):
-    1. Warmup: 跑 10 次丢弃, 排除 JIT 编译 + cache 加载时间
-    2. Sync:   用 torch.cuda.Event 严格测 kernel 时间
-    3. Repeat: 跑 100 次取中位数 (不是平均, 排除 outlier)
-    4. Baseline: 对比 cuBLAS fp16 + Roofline 上限, 给出"快/慢"的绝对判断
-
-输出三个核心指标:
-    - latency: 单次 kernel 时间 (微秒)
-    - TFLOPS:  实际算力利用 (compute intensity)
-    - 加速比:   vs cuBLAS fp16
+对手矩阵:
+    1. Triton W8A8 naive (v1)     - 我们项目第一版, 固定 BLOCK, 当 baseline
+    2. Triton W8A8 autotuned (v2) - 我们项目当前最优版
+    3. cuBLAS fp16                - 用户的"替代方案", W8A8 路线要打的对手
 
 执行:
-    python benchmarks/bench_kernel.py                  # 所有形状
-    python benchmarks/bench_kernel.py --shape S2       # 只跑 S2
-    python benchmarks/bench_kernel.py --reference      # 也测 reference (极慢)
-    python benchmarks/bench_kernel.py --detail         # 打印详细 metrics
+    python benchmarks/bench_kernel.py                    # 所有形状
+    python benchmarks/bench_kernel.py --shape S2         # 只跑 S2
+    python benchmarks/bench_kernel.py --detail           # 每形状详细 metrics
+
+Note: 想跑 PyTorch reference 的极端慢对比, 用 benchmarks/torch_bench.py
 """
 
 import argparse
@@ -28,18 +23,17 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from reference.torch_reference import (
-    w8a8_scaled_mm_reference,
     cublas_fp16_baseline,
     quantize_per_token,
     quantize_per_channel,
 )
-from triton_kernel.w8a8_mm import w8a8_scaled_mm_triton
+from triton_kernel.w8a8_naive import w8a8_scaled_mm_triton as w8a8_naive
+from triton_kernel.w8a8_autotuned import w8a8_scaled_mm_triton as w8a8_autotuned
 
 
 # ============================================================
-# 硬件常数 (需要根据实际 GPU 调整)
+# 硬件常数
 # ============================================================
-
 HARDWARE_SPECS = {
     "NVIDIA GeForce RTX 4090": {
         "int8_tops_dense": 330e12,
@@ -47,19 +41,13 @@ HARDWARE_SPECS = {
         "hbm_bandwidth": 1008e9,
     },
     "NVIDIA GeForce RTX 5090": {
-        # Triton 当前把 SM12x 当 SM80 用, 实际可达算力打折
         "int8_tops_dense": 838e12,
         "fp16_tflops": 419e12,
         "hbm_bandwidth": 1792e9,
     },
 }
-
 DEFAULT_SPEC = HARDWARE_SPECS["NVIDIA GeForce RTX 4090"]
 
-
-# ============================================================
-# LLaMA-7B 测试形状
-# ============================================================
 SHAPES = {
     "S1": (1, 4096, 4096),
     "S2": (16, 4096, 4096),
@@ -69,13 +57,10 @@ SHAPES = {
 
 
 # ============================================================
-# 核心计时函数
+# 核心计时
 # ============================================================
 
 def benchmark_fn(fn, warmup: int = 10, repeat: int = 100) -> dict:
-    """
-    严格的 CUDA kernel 计时.
-    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -91,25 +76,18 @@ def benchmark_fn(fn, warmup: int = 10, repeat: int = 100) -> dict:
         times.append(start.elapsed_time(end))
 
     times.sort()
-    median_ms = times[len(times) // 2]
-    min_ms = times[0]
-    p95_ms = times[int(len(times) * 0.95)]
-
     return {
-        "latency_us": median_ms * 1000,
-        "latency_us_min": min_ms * 1000,
-        "latency_us_p95": p95_ms * 1000,
+        "latency_us": times[len(times) // 2] * 1000,
+        "latency_us_min": times[0] * 1000,
+        "latency_us_p95": times[int(len(times) * 0.95)] * 1000,
     }
 
 
 def compute_metrics(latency_us: float, M: int, N: int, K: int,
                     spec: dict) -> dict:
-    """根据延迟和形状, 算 TFLOPS, 带宽利用, Roofline 位置."""
     latency_s = latency_us * 1e-6
-
     flops = 2 * M * N * K
     tflops = flops / latency_s / 1e12
-
     bytes_moved = M * K + K * N + M * N * 2
     bandwidth_gbps = bytes_moved / latency_s / 1e9
 
@@ -122,19 +100,15 @@ def compute_metrics(latency_us: float, M: int, N: int, K: int,
         roof_tflops = spec["int8_tops_dense"] / 1e12
         bound = "compute"
 
-    bandwidth_util = bandwidth_gbps / (spec["hbm_bandwidth"] / 1e9)
-    compute_util = (tflops * 1e12) / spec["int8_tops_dense"]
-    roof_util = tflops / roof_tflops if roof_tflops > 0 else 0
-
     return {
         "tflops": tflops,
         "bandwidth_gbps": bandwidth_gbps,
-        "bandwidth_util": bandwidth_util,
-        "compute_util": compute_util,
+        "bandwidth_util": bandwidth_gbps / (spec["hbm_bandwidth"] / 1e9),
+        "compute_util": (tflops * 1e12) / spec["int8_tops_dense"],
         "ai": ai,
         "bound": bound,
         "roof_tflops": roof_tflops,
-        "roof_util": roof_util,
+        "roof_util": tflops / roof_tflops if roof_tflops > 0 else 0,
     }
 
 
@@ -142,8 +116,7 @@ def compute_metrics(latency_us: float, M: int, N: int, K: int,
 # 单形状测试
 # ============================================================
 
-def run_shape(shape_id: str, M: int, N: int, K: int, spec: dict,
-              test_reference: bool = False) -> dict:
+def run_shape(shape_id: str, M: int, N: int, K: int, spec: dict) -> dict:
     torch.manual_seed(42)
 
     x_fp16 = torch.randn(M, K, device="cuda", dtype=torch.float16)
@@ -153,118 +126,134 @@ def run_shape(shape_id: str, M: int, N: int, K: int, spec: dict,
 
     result = {"shape_id": shape_id, "M": M, "N": N, "K": K}
 
-    # 1. Triton W8A8
-    bench = benchmark_fn(lambda: w8a8_scaled_mm_triton(x_q, w_q, sa, sb))
-    metrics = compute_metrics(bench["latency_us"], M, N, K, spec)
-    result["triton"] = {**bench, **metrics}
+    # 1. Triton naive (v1)
+    bench = benchmark_fn(lambda: w8a8_naive(x_q, w_q, sa, sb))
+    result["triton_naive"] = {**bench, **compute_metrics(bench["latency_us"], M, N, K, spec)}
 
-    # 2. cuBLAS fp16 baseline
+    # 2. Triton autotuned (v2)
+    bench = benchmark_fn(lambda: w8a8_autotuned(x_q, w_q, sa, sb))
+    result["triton_autotuned"] = {**bench, **compute_metrics(bench["latency_us"], M, N, K, spec)}
+
+    # 3. cuBLAS fp16
     bench = benchmark_fn(lambda: cublas_fp16_baseline(x_fp16, w_fp16))
-    metrics = compute_metrics(bench["latency_us"], M, N, K, spec)
-    result["cublas"] = {**bench, **metrics}
+    result["cublas_fp16"] = {**bench, **compute_metrics(bench["latency_us"], M, N, K, spec)}
 
-    # 3. Reference (可选, 极慢)
-    if test_reference and M * N * K < 1e9:
-        bench = benchmark_fn(
-            lambda: w8a8_scaled_mm_reference(x_q, w_q, sa, sb),
-            warmup=2, repeat=5,
-        )
-        result["reference"] = bench
-
-    # 4. Speedup
-    triton_us = result["triton"]["latency_us"]
-    cublas_us = result["cublas"]["latency_us"]
-    result["speedup_vs_cublas"] = cublas_us / triton_us
-    if "reference" in result:
-        result["speedup_vs_reference"] = result["reference"]["latency_us"] / triton_us
+    # Speedup (基准: autotuned)
+    base = result["triton_autotuned"]["latency_us"]
+    result["speedup"] = {
+        "naive_vs_autotuned": result["triton_naive"]["latency_us"] / base,
+        "autotuned_vs_cublas": result["cublas_fp16"]["latency_us"] / base,
+    }
 
     return result
 
 
 # ============================================================
-# 打印结果
+# 打印
 # ============================================================
 
-def print_results(results: list, spec: dict):
+def print_main_table(results: list):
     print()
-    print("=" * 120)
-    print("Performance Benchmark Results")
-    print("=" * 120)
+    print("=" * 110)
+    print("Performance Benchmark - W8A8 Triton vs cuBLAS fp16 (latency in microseconds)")
+    print("=" * 110)
     print()
 
-    print(f"{'Shape':<6} {'(M,N,K)':<22} "
-          f"{'Triton (us)':<13} {'cuBLAS (us)':<13} "
-          f"{'Speedup':<10} {'TFLOPS':<10} "
-          f"{'Roof%':<8} {'Bound':<10}")
-    print("-" * 120)
+    headers = ["Shape", "(M,N,K)", "naive", "autotuned", "cuBLAS fp16",
+               "TFLOPS", "Roof%", "Bound"]
+    col_w = [6, 22, 11, 12, 13, 12, 8, 10]
+
+    line = ""
+    for h, w in zip(headers, col_w):
+        line += f"{h:<{w}}"
+    print(line)
+    print("-" * 110)
 
     for r in results:
         shape_str = f"({r['M']:>4}, {r['N']:>4}, {r['K']:>4})"
-        triton_us = r["triton"]["latency_us"]
-        cublas_us = r["cublas"]["latency_us"]
-        speedup = r["speedup_vs_cublas"]
-        tflops = r["triton"]["tflops"]
-        roof = r["triton"]["roof_util"]
-        bound = r["triton"]["bound"]
+        row = [
+            r["shape_id"], shape_str,
+            f"{r['triton_naive']['latency_us']:.2f}",
+            f"{r['triton_autotuned']['latency_us']:.2f}",
+            f"{r['cublas_fp16']['latency_us']:.2f}",
+            f"{r['triton_autotuned']['tflops']:.2f}",
+            f"{r['triton_autotuned']['roof_util']*100:.1f}%",
+            r["triton_autotuned"]["bound"],
+        ]
+        line = ""
+        for v, w in zip(row, col_w):
+            line += f"{v:<{w}}"
+        print(line)
 
-        speedup_str = f"{speedup:.2f}x"
 
-        print(f"{r['shape_id']:<6} {shape_str:<22} "
-              f"{triton_us:<13.2f} {cublas_us:<13.2f} "
-              f"{speedup_str:<10} "
-              f"{tflops:<10.2f} "
-              f"{roof*100:<7.1f}% "
-              f"{bound:<10}")
-
+def print_speedup_table(results: list):
     print()
-    print("=" * 120)
+    print("=" * 110)
+    print("Speedup Analysis (基准: Triton autotuned, 数字>1 表示 autotuned 更快)")
+    print("=" * 110)
+    print()
+
+    headers = ["Shape", "naive -> autotuned (优化进度)", "autotuned vs cuBLAS fp16 (替代方案)"]
+    col_w = [6, 40, 40]
+
+    line = ""
+    for h, w in zip(headers, col_w):
+        line += f"{h:<{w}}"
+    print(line)
+    print("-" * 110)
+
+    for r in results:
+        sp = r["speedup"]
+        x = sp["naive_vs_autotuned"]
+        col2 = f"{x:.2f}x" + (" faster than naive" if x > 1 else " slower than naive")
+
+        y = sp["autotuned_vs_cublas"]
+        col3 = f"{y:.2f}x" + (" faster than cuBLAS" if y > 1 else " slower than cuBLAS")
+
+        line = f"{r['shape_id']:<{col_w[0]}}{col2:<{col_w[1]}}{col3:<{col_w[2]}}"
+        print(line)
+
+
+def print_legend():
+    print()
+    print("=" * 110)
     print("解读")
-    print("=" * 120)
+    print("=" * 110)
     print()
-    print("Speedup vs cuBLAS:")
-    print("  > 1.0x: Triton W8A8 比 cuBLAS fp16 快 (W8A8 路线在该形状上有价值)")
-    print("  ~ 1.0x: 持平 (memory-bound 形状常见, dequant 开销吃掉收益)")
-    print("  < 1.0x: 比 cuBLAS 慢 (W8A8 在该形状上没意义, 不如直接用 fp16)")
+    print("对手身份:")
+    print("  naive (v1)     = 我们第一版, 固定 BLOCK=64, 当 baseline")
+    print("  autotuned (v2) = 我们当前最优版, autotune 自动选 BLOCK")
+    print("  cuBLAS fp16    = torch.matmul fp16, 用户的'替代方案'")
     print()
-    print("Roof%: 距 Roofline 上限多远")
-    print("  > 70%: 接近物理极限, 优化空间已小")
-    print("  30-70%: 健康")
-    print("  < 30%: 严重未达上限, 还有大量优化空间 (典型 v1 表现)")
+    print("怎么读:")
+    print("  naive -> autotuned > 1x: 优化有效 (autotune 比固定 BLOCK 快)")
+    print("  autotuned vs cuBLAS > 1x: 用 W8A8 比 fp16 快, 路线有价值")
+    print("  autotuned vs cuBLAS < 1x: 在该形状上 W8A8 不如 fp16, 路线无意义")
     print()
-    print("Bound:")
-    print("  memory:  形状受显存带宽限制, 优化方向 = 减少读写")
-    print("  compute: 形状受算力限制, 优化方向 = 提高 Tensor Core 占用率")
+    print("  Roof%: 距 Roofline 物理上限的百分比")
+    print("    > 70%: 接近极限, 优化空间小")
+    print("    30-70%: 健康范围")
+    print("    < 30%: 还有大量优化空间")
 
 
 def print_per_shape_detail(results: list):
     print()
-    print("=" * 120)
-    print("Per-shape detail")
-    print("=" * 120)
+    print("=" * 110)
+    print("Per-shape detail (Triton autotuned)")
+    print("=" * 110)
 
     for r in results:
+        a = r["triton_autotuned"]
         print()
         print(f"--- {r['shape_id']} (M={r['M']}, N={r['N']}, K={r['K']}) ---")
-        print(f"  AI (ops/byte):       {r['triton']['ai']:.2f}")
-        print(f"  Bound type:          {r['triton']['bound']}")
-        print(f"  Roof TFLOPS:         {r['triton']['roof_tflops']:.2f}")
-        print()
-        print(f"  Triton W8A8:")
-        print(f"    latency (us):      {r['triton']['latency_us']:.2f} "
-              f"(min={r['triton']['latency_us_min']:.2f}, "
-              f"p95={r['triton']['latency_us_p95']:.2f})")
-        print(f"    TFLOPS:            {r['triton']['tflops']:.2f}")
-        print(f"    bandwidth (GB/s):  {r['triton']['bandwidth_gbps']:.1f}")
-        print(f"    bandwidth util:    {r['triton']['bandwidth_util']*100:.1f}%")
-        print(f"    compute util:      {r['triton']['compute_util']*100:.1f}%")
-        print(f"    roof util:         {r['triton']['roof_util']*100:.1f}%")
-        print()
-        print(f"  cuBLAS fp16:")
-        print(f"    latency (us):      {r['cublas']['latency_us']:.2f}")
-        print(f"    TFLOPS:            {r['cublas']['tflops']:.2f}")
-        print(f"    bandwidth (GB/s):  {r['cublas']['bandwidth_gbps']:.1f}")
-        print()
-        print(f"  Speedup vs cuBLAS:   {r['speedup_vs_cublas']:.2f}x")
+        print(f"  AI:             {a['ai']:.2f} ops/byte ({a['bound']}-bound)")
+        print(f"  Roof TFLOPS:    {a['roof_tflops']:.2f}")
+        print(f"  Autotuned: lat={a['latency_us']:.2f}us "
+              f"(min={a['latency_us_min']:.2f}, p95={a['latency_us_p95']:.2f}), "
+              f"TFLOPS={a['tflops']:.2f}, "
+              f"BW util={a['bandwidth_util']*100:.1f}%, "
+              f"Compute util={a['compute_util']*100:.1f}%, "
+              f"Roof util={a['roof_util']*100:.1f}%")
 
 
 # ============================================================
@@ -273,10 +262,8 @@ def print_per_shape_detail(results: list):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--shape", choices=list(SHAPES.keys()) + ["all"],
-                        default="all")
+    parser.add_argument("--shape", choices=list(SHAPES.keys()) + ["all"], default="all")
     parser.add_argument("--detail", action="store_true")
-    parser.add_argument("--reference", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -291,7 +278,7 @@ def main():
     print(f"HBM Bandwidth:       {spec['hbm_bandwidth']/1e9:.0f} GB/s")
     print(f"AI Crossover:        {spec['int8_tops_dense']/spec['hbm_bandwidth']:.1f} ops/byte")
     if gpu_name not in HARDWARE_SPECS:
-        print(f"WARN: GPU not in spec table, using 4090 numbers as fallback")
+        print(f"WARN: GPU not in spec table, using 4090 fallback")
 
     if args.shape == "all":
         shapes_to_run = list(SHAPES.items())
@@ -299,16 +286,21 @@ def main():
         shapes_to_run = [(args.shape, SHAPES[args.shape])]
 
     print()
+    print("Note: 第一次跑 autotuned 版本会触发 autotune (每形状 10-30s)")
+    print()
+
     results = []
     for shape_id, (M, N, K) in shapes_to_run:
         print(f"Running {shape_id} (M={M}, N={N}, K={K}) ...", end=" ", flush=True)
         t0 = time.time()
-        r = run_shape(shape_id, M, N, K, spec, test_reference=args.reference)
+        r = run_shape(shape_id, M, N, K, spec)
         t1 = time.time()
         print(f"done ({t1-t0:.1f}s)")
         results.append(r)
 
-    print_results(results, spec)
+    print_main_table(results)
+    print_speedup_table(results)
+    print_legend()
     if args.detail:
         print_per_shape_detail(results)
 
