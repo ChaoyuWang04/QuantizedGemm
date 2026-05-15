@@ -30,3 +30,5 @@ benchmarks/results/
 benchmarks/nsight/
 profiling_reports/
 third_party/
+
+models/
