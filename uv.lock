@@ -1788,6 +1788,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -1836,6 +1837,7 @@ requires-dist = [
     { name = "tabulate", marker = "extra == 'analysis'" },
     { name = "tabulate", marker = "extra == 'runpod'" },
     { name = "torch", specifier = ">=2.4.0" },
+    { name = "transformers", specifier = ">=5.8.1" },
     { name = "transformers", marker = "extra == 'integration'" },
     { name = "transformers", marker = "extra == 'runpod'" },
     { name = "triton", marker = "extra == 'gpu'", specifier = ">=3.0.0" },
