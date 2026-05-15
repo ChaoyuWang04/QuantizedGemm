@@ -33,7 +33,7 @@ from reference.torch_reference import (
     quantize_per_token,
     quantize_per_channel,
 )
-from triton_kernel.w8a8_mm import w8a8_scaled_mm_triton
+from triton_kernel.w8a8_naive import w8a8_scaled_mm_triton
 
 
 # LLaMA-7B 测试形状
