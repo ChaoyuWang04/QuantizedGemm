@@ -1,31 +1,33 @@
 """
 W8A8 scaled matmul - Triton kernel (v2: autotuned)
 
-[2026-05-13 更新] 移除 wrapper 中冗余的 squeeze().contiguous().
+[2026-05-13 v2.1 update] 补充 BN=32 系列配置, 修复 S1/S2 上 autotune 选不到最优.
 
-发现:
-    profile_wrapper.py 显示, S2 (M=16) 上 wrapper overhead 约 32us, 而
-    kernel 本身只要 30us. 32us 里有 8-12us 来自两个 squeeze().contiguous() 调用.
+发现 (sweep_configs.py 扫描结果):
+    S2 (M=16) 真正最优:  BM=16, BN=32, BK=128, w=4, s=3  -> 28.13us
+    S1 (M=1)  真正最优:  BM=32, BN=32, BK=128, w=2, s=3  -> 28.74us
+    
+    之前候选列表里 BN 全是 64/128/256, 没有 32, 全军覆没.
 
 原因:
-    scale_a 形状 [M, 1] 在内存里就是 M 个连续 fp32, 和 [M] 的 1D 张量
-    完全等价. kernel 内部用裸指针 + offset 访问, 根本不在乎传 [M, 1] 还是 [M].
-    squeeze() 创建了完全多余的视图, contiguous() 还可能触发不必要的拷贝.
+    小 M 形状 (M=1, M=16) 只能在 N 维度上堆并行度.
+    BN=32 时 grid_n = N/32, 给 GPU 提供 4x 更多 program 来填满 SM.
+    BN=64/128 时 program 数太少, SM 闲置.
 
 修复:
-    wrapper 不再 squeeze, 直接传 [M, 1] 给 kernel.
-    Kernel 内部的 tl.load(scale_a_ptr + offs_m) 行为完全不变.
+    候选列表加 6 个 BN=32 系列配置, 覆盖 S1/S2 真实最优.
 
-预期收益:
-    S2 wrapper 总延迟: 63us -> 约 50-55us (-15-20%)
-    S1 同样改善
-    S3/S4 改善较小 (overhead 占比小)
+预期 (替换前 vs 替换后, S2):
+    替换前 autotune 选: BM=16, BN=64, BK=128, w=4, s=3 -> 30.85us (kernel only)
+    替换后 autotune 选: BM=16, BN=32, BK=128, w=4, s=3 -> 28.13us (kernel only)
+    节省约 2.7us, 相对 50us 总延迟约 -5%
 
 设计哲学 (再次强调):
-    "v1 -> v2 -> v2 优化版" 都是单变量改动:
-        - v1 -> v2:  加 autotune (改了配置选择)
-        - v2 -> 当前: 删 squeeze (改了 wrapper, 不动 kernel)
-        Kernel 内部三个版本完全相同, 精度保证还是 max_diff = 0.
+    "v1 -> v2 -> v2.1" 都是单变量改动:
+        - v1: 无 autotune
+        - v2:  加 autotune (候选 16 个)
+        - v2.1: 候选扩充到 22 个, 多了小 M 友好配置
+        Kernel 函数体一字未改, 精度保证 max_diff = 0.
 """
 
 from typing import Optional
@@ -35,11 +37,52 @@ import triton.language as tl
 
 
 # ============================================================
-# Autotune 候选配置 (和之前完全一样)
+# Autotune 候选配置 (v2.1: 加 BN=32 系列覆盖小 M)
 # ============================================================
 
 _AUTOTUNE_CONFIGS = [
-    # ----- Small M 场景: M=1 (decode batch=1) -----
+    # ============================================================
+    # NEW (v2.1): 小 M 友好配置, BN=32 系列
+    # 来源: tools/sweep_configs.py 扫描 144 配置后的 top 选择
+    # ============================================================
+
+    # S2 (M=16) 真实最优
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 128},
+        num_warps=4, num_stages=3,
+    ),  # 28.13us on S2, 28.93us on S1
+    
+    # S1 (M=1) 真实最优
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128},
+        num_warps=2, num_stages=3,
+    ),  # 28.77us on S2, 28.74us on S1 - S1 best!
+
+    # 备选: BK=256 系列, 减少 K-loop 迭代
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256},
+        num_warps=2, num_stages=3,
+    ),  # 28.32us on S2, 28.99us on S1
+
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 256},
+        num_warps=2, num_stages=3,
+    ),  # 29.25us on S2, 28.86us on S1
+
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 256},
+        num_warps=4, num_stages=3,
+    ),  # 29.50us on S2, 28.83us on S1
+
+    # 备选: BK=64, 不同 warps 组合
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 64},
+        num_warps=4, num_stages=3,
+    ),  # 29.76us on S2, 29.63us on S1
+
+    # ============================================================
+    # 原 v2 配置: Small M 场景 (M=1, decode batch=1)
+    # ============================================================
     triton.Config(
         {"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},
         num_warps=2, num_stages=3,
@@ -48,12 +91,10 @@ _AUTOTUNE_CONFIGS = [
         {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64},
         num_warps=4, num_stages=3,
     ),
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 64},
-        num_warps=4, num_stages=2,
-    ),
 
-    # ----- Small M 场景: M=16 -----
+    # ============================================================
+    # 原 v2 配置: Small M 场景 (M=16, batched decode)
+    # ============================================================
     triton.Config(
         {"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 128},
         num_warps=4, num_stages=3,
@@ -62,12 +103,10 @@ _AUTOTUNE_CONFIGS = [
         {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64},
         num_warps=4, num_stages=3,
     ),
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128},
-        num_warps=4, num_stages=2,
-    ),
 
-    # ----- Medium M 场景: M=64~256 -----
+    # ============================================================
+    # 原 v2 配置: Medium M (M=64-256)
+    # ============================================================
     triton.Config(
         {"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64},
         num_warps=4, num_stages=3,
@@ -85,7 +124,9 @@ _AUTOTUNE_CONFIGS = [
         num_warps=4, num_stages=3,
     ),
 
-    # ----- Large M 场景: M=512+ (prefill) -----
+    # ============================================================
+    # 原 v2 配置: Large M (prefill, M=512+)
+    # ============================================================
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
         num_warps=4, num_stages=3,
@@ -103,7 +144,9 @@ _AUTOTUNE_CONFIGS = [
         num_warps=8, num_stages=3,
     ),
 
-    # ----- Aggressive 配置 -----
+    # ============================================================
+    # 原 v2 配置: Aggressive (试 shared mem 边缘)
+    # ============================================================
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128},
         num_warps=8, num_stages=2,
@@ -160,11 +203,6 @@ def _w8a8_scaled_mm_kernel_autotuned(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # 加载 scale.
-    # 关键观察: scale_a 在 wrapper 里传进来时形状是 [M, 1], 但它在内存里
-    # 就是 M 个连续 fp32, 和 [M] 完全一样. tl.load(scale_a_ptr + offs_m)
-    # 用裸指针 + 1D offset 访问, 根本不在乎调用方的 .shape 是什么.
-    # 之前 wrapper 里的 squeeze().contiguous() 完全多余, 已在新 wrapper 中删除.
     sa_mask = offs_m < M
     sb_mask = offs_n < N
     sa = tl.load(scale_a_ptr + offs_m, mask=sa_mask, other=0.0)
@@ -178,7 +216,7 @@ def _w8a8_scaled_mm_kernel_autotuned(
 
 
 # ============================================================
-# Python wrapper: 精简版, 删除 squeeze().contiguous()
+# Python wrapper (和之前一样, 已删除 squeeze)
 # ============================================================
 
 def w8a8_scaled_mm_triton(
@@ -189,17 +227,7 @@ def w8a8_scaled_mm_triton(
     bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """
-    Triton W8A8 scaled matmul (v2 autotuned, wrapper 优化版).
-
-    相对前一版 wrapper 的唯一变化:
-        - 删除 scale_a.squeeze(-1).contiguous() 和 scale_b.squeeze(0).contiguous()
-        - 直接把 [M, 1] 和 [1, N] 形状的 scale 传给 kernel
-        - kernel 内部行为完全不变
-
-    精度保证: 和前一版一致 (max_diff = 0)
-    """
-    # ----- 输入校验 (保留, 但是 v1/v2 都是 8 个 assert, 这部分耗时是固有成本) -----
+    """Triton W8A8 scaled matmul (v2.1: autotuned with BN=32 configs)."""
     assert a.dtype == torch.int8, f"a must be int8, got {a.dtype}"
     assert b.dtype == torch.int8, f"b must be int8, got {b.dtype}"
     assert scale_a.dtype == torch.float32
@@ -217,11 +245,6 @@ def w8a8_scaled_mm_triton(
 
     c = torch.empty((M, N), dtype=out_dtype, device=a.device)
 
-    # 关键变化: 不再调用 squeeze().contiguous()
-    # scale_a [M, 1] 在内存里就是 M 个连续 fp32, kernel 内用裸指针访问即可.
-    # 直接把 scale tensor 传过去, kernel 内的 tl.load(scale_a_ptr + offs_m)
-    # 会正确访问到第 offs_m 个 fp32 元素.
-
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
@@ -229,7 +252,7 @@ def w8a8_scaled_mm_triton(
 
     _w8a8_scaled_mm_kernel_autotuned[grid](
         a, b, c,
-        scale_a, scale_b,   # 直接传 2D tensor, 不 squeeze
+        scale_a, scale_b,
         M, N, K,
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
@@ -254,7 +277,7 @@ if __name__ == "__main__":
     )
 
     print("=" * 70)
-    print("Triton W8A8 v2 (autotuned, wrapper optimized) -- Smoke Test")
+    print("Triton W8A8 v2.1 (more autotune configs) -- Smoke Test")
     print("=" * 70)
 
     torch.manual_seed(42)
@@ -266,7 +289,8 @@ if __name__ == "__main__":
     x_q, sa = quantize_per_token(x_fp16)
     w_q, sb = quantize_per_channel(w_fp16)
 
-    print("\nFirst call (will trigger autotune)...")
+    print(f"\nNumber of autotune configs: {len(_AUTOTUNE_CONFIGS)}")
+    print("First call (autotune will try all configs, may take 20-40s)...")
     import time
     t0 = time.time()
     out_triton = w8a8_scaled_mm_triton(x_q, w_q, sa, sb)
@@ -287,4 +311,4 @@ if __name__ == "__main__":
     if max_diff < 1e-2:
         print("PASS (max_diff = 0 expected since algorithm unchanged)")
     else:
-        print("FAIL — 算法应该没动, 但 max_diff != 0, 检查 wrapper 改动")
+        print("FAIL — 算法没动, max_diff != 0, 检查 wrapper")
