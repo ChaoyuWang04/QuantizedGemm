@@ -113,46 +113,44 @@ GSM8K_SUBSET = [
 
 def extract_answer_number(text: str):
     """
-    从生成文本里提取数字答案. 
+    [v3 策略] 从精确到模糊:
+        1. "= X" 模式 (后面无运算符): 算术题主路径
+           例: "91 + 24 = 115" -> 115
+        2. "answer is X" / "\\boxed{X}": 推理题主路径
+           例: "The answer is 42" -> 42
+        3. 文本最后一个数字: 通用 fallback
     
-    [新策略] 优先取"生成开头附近"的数字, 因为正确答案通常在最前面.
-    这避免了上一版"取最后一个数字"被中间步骤数字干扰的 bug.
-    
-    顺序:
-        1. 文本第一行/第一句的数字
-        2. "answer is X" 或 "\\boxed{X}" 模式
-        3. fallback: 整个文本第一个数字
+    [上一版 v2 的 bug]
+        v2 取"第一句的第一个数字", 在算术题里会取到等号左边的算子, 
+        比如 "91 + 24 = 115" 取 91. 这次 v3 优先看 "= X" 模式修复.
     """
-    # 取第一行 (或第一句, 用 . 截断)
-    first_chunk = text.strip().split("\n")[0]
-    first_chunk = first_chunk.split(".")[0] + "."   # 保留首句
+    text = text.strip()
     
-    # 先在第一句里找数字
-    numbers = re.findall(r"-?\d+", first_chunk)
-    if numbers:
+    # 策略 1: "= X" 模式 (X 后面没有继续运算符)
+    eq_matches = re.findall(r"=\s*(-?\d+)(?!\s*[+\-*/])", text)
+    if eq_matches:
         try:
-            return int(numbers[0])    # 第一句的第一个数字
+            return int(eq_matches[-1])   # 最右边的 "= X"
         except ValueError:
             pass
     
-    # fallback: 找 explicit 答案标记
+    # 策略 2: 显式答案模式
     for pattern in [
         r"answer\s*(?:is|:)?\s*\$?(-?\d+)",
         r"\\boxed\{(-?\d+)\}",
-        r"=\s*\$?(-?\d+)",
     ]:
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
             try:
-                return int(matches[0])    # 第一个匹配
+                return int(matches[-1])
             except ValueError:
                 pass
     
-    # 最后 fallback: 整个文本第一个数字
-    all_numbers = re.findall(r"-?\d+", text)
-    if all_numbers:
+    # 策略 3: 最后一个数字 (通用 fallback)
+    numbers = re.findall(r"-?\d+", text)
+    if numbers:
         try:
-            return int(all_numbers[0])
+            return int(numbers[-1])
         except ValueError:
             pass
     
