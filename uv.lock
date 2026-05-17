@@ -704,6 +704,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/89/a5/33b49ba7bea7c41bb37f74ec0f8beea0831e052330196633fe2c77516ea6/huggingface_hub-1.14.0-py3-none-any.whl", hash = "sha256:efe075535c62e130b30e836b138e13785f6f043d1f0539e0a39aa411a99e90b8", size = 661479, upload-time = "2026-05-06T14:14:32.029Z" },
 ]
 
+[package.optional-dependencies]
+hf-xet = [
+    { name = "hf-xet" },
+]
+
 [[package]]
 name = "idna"
 version = "3.15"
@@ -1838,6 +1843,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "huggingface-hub", extra = ["hf-xet"] },
     { name = "modelscope" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1882,6 +1888,7 @@ requires-dist = [
     { name = "accelerate", specifier = ">=1.13.0" },
     { name = "datasets", marker = "extra == 'integration'" },
     { name = "datasets", marker = "extra == 'runpod'" },
+    { name = "huggingface-hub", extras = ["cli", "hf-xet"], specifier = ">=1.14.0" },
     { name = "lm-eval", marker = "extra == 'integration'" },
     { name = "lm-eval", marker = "extra == 'runpod'" },
     { name = "matplotlib", marker = "extra == 'analysis'" },
